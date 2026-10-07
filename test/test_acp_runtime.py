@@ -9818,9 +9818,11 @@ async def test_activate_mode_bracketed_allows_the_launched_agent_every_start():
     rt, _, _ = _make_runtime()
     rt._agent = "kirocrew"
     # No spawn_agent_name on the shared runtime: the allowance is keyed on
-    # self._agent alone.
-    rt._native_skill_projection = NativeSkillProjection(aliases={})
-    refreshed = NativeSkillProjection(aliases={})
+    # self._agent alone. The projected spec grants no identity-bound server, so the
+    # reconcile is a no-op.
+    benign = {"name": "kirocrew", "allowedTools": [], "mcpServers": {}}
+    rt._native_skill_projection = NativeSkillProjection(aliases={}, specs={"kirocrew": benign})
+    refreshed = NativeSkillProjection(aliases={}, specs={"kirocrew": benign})
     captured: dict = {}
 
     async def _send(method, params, *, timeout=None, **kwargs):
@@ -9836,7 +9838,12 @@ async def test_activate_mode_bracketed_allows_the_launched_agent_every_start():
         return_value=refreshed,
     ):
         await rt._activate_mode_bracketed(
-            "s1", "kirocrew", budget=30.0, payload_snapshot=None, wire_registered=True
+            "s1",
+            "kirocrew",
+            budget=30.0,
+            payload_snapshot=None,
+            wire_registered=True,
+            session_work_dir="/tmp",
         )
 
     # The launched agent's authored name goes on the wire (translate=False), with
@@ -9846,6 +9853,209 @@ async def test_activate_mode_bracketed_allows_the_launched_agent_every_start():
     assert captured["params"]["modeId"] == "kirocrew"
     assert captured["kwargs"].get("translate") is False
     assert refreshed.spawn_agent_name == ""
+
+
+@pytest.mark.asyncio
+async def test_activate_mode_bracketed_refuses_a_live_toggle_the_empty_gate_misses():
+    """The fail-open GPT flagged: a ``disabledTools`` toggle added to a warm
+    runtime's spec AFTER the mount read leaves the per-call gate empty while the
+    per-session element is already mounted, so approving the tool runs it. The
+    bracket re-runs the mount's own predicate over the PROJECTED spec right before
+    the send and refuses even when the carried gate is EMPTY -- the empty set is
+    exactly this case, not a no-op."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+    from kiro_crew.agent_materialization.worker_agent import DerivedSpecSnapshot
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    # The pre-prep snapshot the mount composed from carried nothing.
+    snapshot = DerivedSpecSnapshot("id", "fp", {"name": "kirocrew", "allowedTools": []})
+    rt._send_and_await = AsyncMock()  # type: ignore[method-assign]
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+
+    # The PROJECTED spec now grants kirocrew-core by name (tools) and switches off
+    # learn_add, and does NOT auto-approve it, so the mount's predicate would CARRY
+    # the deny -- but the running session's gate carries nothing.
+    live = {
+        "name": "kirocrew",
+        "tools": ["@kirocrew-core"],
+        "allowedTools": [],
+        "mcpServers": {"kirocrew-core": {"disabledTools": ["learn_add"]}},
+    }
+    refreshed = NativeSkillProjection(aliases={}, specs={"kirocrew": live})
+    rt._native_skill_projection = refreshed
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        with pytest.raises(AcpRuntimeError, match="restricts a tool"):
+            await rt._activate_mode_bracketed(
+                "s1",
+                "kirocrew",
+                budget=30.0,
+                payload_snapshot=snapshot,
+                wire_registered=True,
+                session_work_dir="/tmp",
+                carried_denied=frozenset(),
+            )
+    # Refused BEFORE any set_mode goes out, and the already-created session is torn
+    # down rather than left running the unenforced toggle.
+    rt._send_and_await.assert_not_called()
+    rt.terminate_session.assert_awaited_once_with("s1")
+
+
+@pytest.mark.asyncio
+async def test_activate_mode_bracketed_skips_the_reconcile_on_a_non_kiro_backend():
+    """Design's blocker: KAS reaches this bracket and loads the same spec but mounts
+    no control-plane element, so its carried set is always empty. The reconcile is
+    gated behind a positive ``acp_backend == ACP_BACKEND_KIRO`` check, so a KAS
+    session whose projected spec grants kirocrew-core by name with a disabledTools
+    toggle on STILL STARTS -- the gate keeps the reconcile where the carry mechanism
+    exists."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+    from kiro_crew.acp.types import ACP_BACKEND_KAS
+
+    rt, _, _ = _make_runtime()
+    rt._acp_backend = ACP_BACKEND_KAS
+    rt._agent = "ops"
+    captured: dict = {}
+
+    async def _send(method, params, *, timeout=None, **kwargs):
+        captured["sent"] = params.get("modeId")
+        return {}
+
+    rt._send_and_await = AsyncMock(side_effect=_send)  # type: ignore[method-assign]
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+
+    # A projected spec that WOULD refuse on kiro (by-name core grant + disabled
+    # learn_add, not auto-approved). On KAS the reconcile never runs.
+    live = {
+        "name": "ops",
+        "tools": ["@kirocrew-core"],
+        "allowedTools": [],
+        "mcpServers": {"kirocrew-core": {"disabledTools": ["learn_add"]}},
+    }
+    refreshed = NativeSkillProjection(aliases={}, specs={"ops": live})
+    rt._native_skill_projection = refreshed
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        # No raise: the KAS session starts, the set_mode is sent, nothing torn down.
+        await rt._activate_mode_bracketed(
+            "s1",
+            "ops",
+            budget=30.0,
+            payload_snapshot=None,
+            wire_registered=True,
+            session_work_dir="/tmp",
+            carried_denied=frozenset(),
+        )
+    rt._send_and_await.assert_awaited()
+    rt.terminate_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refuse_carried_deny_bypass_allows_a_toggle_the_gate_already_carries():
+    """A live ``disabledTools`` toggle that the per-call gate ALREADY carries is
+    enforced, not a gap -- the reconcile must not refuse the ordinary case where the
+    mount saw the toggle and carried it. Driven at the helper so the assertion is
+    about the reconcile alone, not the rest of the bracket. The caller passes the
+    PROJECTED spec; here it declares the same toggle the gate carries."""
+    rt, _, _ = _make_runtime()
+
+    # Projected spec declares the SAME toggle the gate carries -> the mount's
+    # predicate carries exactly that pair, which the session's gate already holds.
+    live = {
+        "name": "kirocrew",
+        "tools": ["@kirocrew-core"],
+        "allowedTools": [],
+        "mcpServers": {"kirocrew-core": {"disabledTools": ["learn_add"]}},
+    }
+    # No raise: the carried gate covers the live toggle.
+    await rt._refuse_carried_deny_bypass(
+        "kirocrew", frozenset({("kirocrew-core", "learn_add")}), "/tmp", live
+    )
+
+
+@pytest.mark.asyncio
+async def test_refuse_carried_deny_bypass_allows_an_agent_that_grants_no_core_server():
+    """An agent whose spec grants no identity-bound server is skipped by the mount's
+    own predicate (``allow.grants`` is false), so the reconcile reaches an empty
+    verdict and does not refuse. This is the Design invariant: a single global
+    MCP-tab toggle on a core tool must NOT stop a custom agent that never references
+    kirocrew-core from starting, because that agent never mounted the element."""
+    rt, _, _ = _make_runtime()
+
+    # A projected spec that grants NO identity-bound server. Even if settings
+    # globally disable a core tool, this agent never mounts the element, so the
+    # mount's predicate carries/withholds nothing for it.
+    live = {
+        "name": "custom",
+        "allowedTools": [],
+        "mcpServers": {},
+    }
+    # No raise: the predicate grants nothing, so there is nothing to reconcile.
+    await rt._refuse_carried_deny_bypass("custom", frozenset(), "/tmp", live)
+
+
+@pytest.mark.asyncio
+async def test_refuse_carried_deny_bypass_allows_a_null_projected_spec():
+    """A ``None`` projected spec (the projection carries no entry for this agent) is
+    nothing to reconcile against -- the mount's own predicate returns an empty
+    verdict for the same input, so the reconcile is a no-op rather than a refusal."""
+    rt, _, _ = _make_runtime()
+    # No raise: a null live spec short-circuits to an empty verdict.
+    await rt._refuse_carried_deny_bypass("kirocrew", frozenset(), "/tmp", None)
+
+
+@pytest.mark.asyncio
+async def test_refuse_carried_deny_bypass_refuses_an_auto_approved_carried_pair():
+    """GPT's earlier bypass: the gate DOES carry ``(kirocrew-core, learn_add)``, but a
+    later ``allowedTools`` edit whole-server auto-approves kirocrew-core. The mount's
+    own predicate then WITHHOLDS the element for that server (an auto-approved toggle
+    cannot be carried on the per-call gate), so the live verdict withholds a server
+    the running session mounted a carried pair for. The reconcile refuses: the gate
+    carrying it does not make it safe, because kiro-cli sends no permission request
+    for an auto-approved tool and the carried deny never fires."""
+    rt, _, _ = _make_runtime()
+
+    live = {
+        "name": "kirocrew",
+        "tools": ["@kirocrew-core"],
+        "allowedTools": ["@kirocrew-core"],
+        "mcpServers": {"kirocrew-core": {"disabledTools": ["learn_add"]}},
+    }
+    with pytest.raises(AcpRuntimeError, match="restricts a tool"):
+        await rt._refuse_carried_deny_bypass(
+            "kirocrew", frozenset({("kirocrew-core", "learn_add")}), "/tmp", live
+        )
+
+
+@pytest.mark.asyncio
+async def test_refuse_carried_deny_bypass_reads_the_session_work_dir_not_the_runtime():
+    """GPT F2: a shared runtime starting a CHILD project's session must reconcile its
+    settings against that child's work dir (``session_work_dir``), not the parent
+    runtime's ``self._work_dir``. The helper threads ``session_work_dir`` into the
+    mount predicate's settings read, so a toggle the child project adds is seen."""
+    rt, _, _ = _make_runtime()
+    rt._work_dir = "/parent/project"
+
+    seen: dict = {}
+
+    def _mount(agent, *, work_dir, spec_override=None, existing_names=None):
+        seen["mount_work_dir"] = str(work_dir)
+        from kiro_crew.acp.session_mcp import NativeControlPlaneMount
+
+        return NativeControlPlaneMount([], {})
+
+    live = {"name": "kirocrew", "allowedTools": [], "mcpServers": {}}
+    with patch("kiro_crew.acp.session_mcp.kiro_control_plane_servers", side_effect=_mount):
+        await rt._refuse_carried_deny_bypass("kirocrew", frozenset(), "/child/project", live)
+
+    # The predicate's settings were read for the per-SESSION work dir, not the parent.
+    assert seen["mount_work_dir"] == "/child/project"
+    assert seen["mount_work_dir"] != str(rt._work_dir)
 
 
 @pytest.mark.asyncio
@@ -9874,6 +10084,7 @@ async def test_activate_mode_bracketed_refresh_still_rejects_a_foreign_mode():
                 budget=30.0,
                 payload_snapshot=None,
                 wire_registered=True,
+                session_work_dir="/tmp",
             )
     rt._send_and_await.assert_not_called()
     # The shared runtime does NOT set spawn_agent_name, and recognise() does not
@@ -9907,9 +10118,15 @@ async def test_two_shared_sessions_both_start_as_the_launched_agent():
 
     rt._send_and_await = AsyncMock(side_effect=_send)  # type: ignore[method-assign]
 
-    with patch(
-        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
-        return_value=refreshed,
+    with (
+        patch(
+            "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+            return_value=refreshed,
+        ),
+        patch(
+            "kiro_crew.acp.session_mcp._agent_spec_for",
+            return_value={"name": "kirocrew", "allowedTools": [], "mcpServers": {}},
+        ),
     ):
         for session_id in ("s1", "s2"):
             await rt._activate_mode_bracketed(
@@ -9918,6 +10135,7 @@ async def test_two_shared_sessions_both_start_as_the_launched_agent():
                 budget=30.0,
                 payload_snapshot=None,
                 wire_registered=True,
+                session_work_dir="/tmp",
             )
 
     # Both sessions sent set_mode for the launched agent; the second did NOT fail,

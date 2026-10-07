@@ -178,7 +178,12 @@ def _waiting_on_projection_lock(rt: AcpRuntime) -> bool:
 def _start(rt: AcpRuntime, session_id: str) -> "asyncio.Task[None]":
     return asyncio.ensure_future(
         rt._activate_mode_bracketed(
-            session_id, "ops", budget=5.0, payload_snapshot=None, wire_registered=True
+            session_id,
+            "ops",
+            budget=5.0,
+            payload_snapshot=None,
+            wire_registered=True,
+            session_work_dir="/tmp",
         )
     )
 
@@ -193,6 +198,10 @@ async def _run(rt: AcpRuntime, prepare: _ScriptedPrepare, body: Callable[[], Any
                 side_effect=prepare,
             ),
             patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None),
+            # These scripted projections carry aliases only (``specs`` is empty), so
+            # the carried-deny reconcile reads a ``None`` projected spec for "ops" and
+            # is a deterministic no-op -- these tests are about the projection-adoption
+            # race, not that reconcile.
         ):
             await asyncio.wait_for(body(), timeout=10)
     finally:
@@ -546,6 +555,10 @@ async def test_a_newer_preparation_that_yields_no_view_leaves_a_pending_start_un
                 side_effect=prepare,
             ),
             patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None),
+            # These scripted projections carry aliases only (``specs`` is empty), so
+            # the carried-deny reconcile reads a ``None`` projected spec for "ops" and
+            # is a deterministic no-op -- these tests are about the projection-adoption
+            # race, not that reconcile.
         ):
             await asyncio.wait_for(body(), timeout=10)
     finally:

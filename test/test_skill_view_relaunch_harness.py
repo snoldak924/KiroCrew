@@ -58,6 +58,16 @@ pytestmark = pytest.mark.skipif(
 SPAWNS = 50
 AGENTS = ("kirocrew", "ops", "review", "plain")
 
+
+def _EMPTY_MOUNT():
+    """An empty control-plane mount: the carried-deny reconcile reaches an empty
+    verdict and is a no-op. Lets these tests drive the real bracket without their
+    temp-project agent specs deciding the reconcile."""
+    from kiro_crew.acp.session_mcp import NativeControlPlaneMount
+
+    return NativeControlPlaneMount([], {})
+
+
 _IN_MODIFY = 0x002
 _IN_ATTRIB = 0x004
 _IN_CLOSE_WRITE = 0x008
@@ -352,7 +362,17 @@ async def _one_spawn(
     await asyncio.sleep(0)
     views: dict[str, str] = {}
     try:
-        with patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None):
+        with (
+            patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None),
+            # The carried-deny reconcile runs the mount predicate over the projected
+            # spec; this harness builds real projections from the temp project, so pin
+            # the predicate to an empty mount (no-op) -- these tests are about the
+            # relaunch/view machinery, not that reconcile.
+            patch(
+                "kiro_crew.acp.session_mcp.kiro_control_plane_servers",
+                side_effect=lambda *a, **k: _EMPTY_MOUNT(),
+            ),
+        ):
             for name in AGENTS:
                 before = len(host.activated)
                 if name in refused:
@@ -361,7 +381,12 @@ async def _one_spawn(
                     with pytest.raises(runtime_mod.AcpRuntimeError, match="Restart the gateway"):
                         await asyncio.wait_for(
                             rt._activate_mode_bracketed(
-                                "s1", name, budget=5.0, payload_snapshot=None, wire_registered=True
+                                "s1",
+                                name,
+                                budget=5.0,
+                                payload_snapshot=None,
+                                wire_registered=True,
+                                session_work_dir="/tmp",
                             ),
                             timeout=10,
                         )
@@ -369,7 +394,12 @@ async def _one_spawn(
                     continue
                 await asyncio.wait_for(
                     rt._activate_mode_bracketed(
-                        "s1", name, budget=5.0, payload_snapshot=None, wire_registered=True
+                        "s1",
+                        name,
+                        budget=5.0,
+                        payload_snapshot=None,
+                        wire_registered=True,
+                        session_work_dir="/tmp",
                     ),
                     timeout=10,
                 )
@@ -543,12 +573,21 @@ async def test_a_rewriter_that_wins_the_announcement_race_never_runs_an_unverifi
     try:
         with (
             patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None),
+            patch(
+                "kiro_crew.acp.session_mcp.kiro_control_plane_servers",
+                side_effect=lambda *a, **k: _EMPTY_MOUNT(),
+            ),
             patch.object(runtime_mod, "emit_counter", lambda n, a: counter.append(a["outcome"])),
             pytest.raises(runtime_mod.AcpRuntimeError, match="Restart the gateway"),
         ):
             await asyncio.wait_for(
                 rt._activate_mode_bracketed(
-                    "s1", "late", budget=5.0, payload_snapshot=None, wire_registered=True
+                    "s1",
+                    "late",
+                    budget=5.0,
+                    payload_snapshot=None,
+                    wire_registered=True,
+                    session_work_dir="/tmp",
                 ),
                 timeout=10,
             )

@@ -4297,6 +4297,11 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
         _superseding_alias = runtime_module.AcpRuntime._superseding_alias
         _refuse_if_view_superseded = runtime_module.AcpRuntime._refuse_if_view_superseded
         _refuse_if_view_unverified = runtime_module.AcpRuntime._refuse_if_view_unverified
+        _refuse_carried_deny_bypass = runtime_module.AcpRuntime._refuse_carried_deny_bypass
+        # The carried-deny reconcile runs on the kiro backend before each send over the
+        # PROJECTED spec (projection.specs.get(agent)); these projections carry aliases
+        # only (empty specs), so the live spec is None and the reconcile is a no-op.
+        acp_backend = runtime_module.ACP_BACKEND_KIRO
         _note_unadopted_skill_projection = (
             runtime_module.AcpRuntime._note_unadopted_skill_projection
         )
@@ -4321,11 +4326,25 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
     activate = types.MethodType(runtime_module.AcpRuntime._activate_mode_bracketed, stub)
     if fresh is None:
         with pytest.raises(runtime_module.AcpRuntimeError, match="could not be prepared"):
-            await activate("sid", "crew", budget=5.0, payload_snapshot=None, wire_registered=False)
+            await activate(
+                "sid",
+                "crew",
+                budget=5.0,
+                payload_snapshot=None,
+                wire_registered=False,
+                session_work_dir="/tmp",
+            )
         assert sent == [] and terminated == ["sid"]
         assert stub._native_skill_projection is spawn
         return
-    await activate("sid", "crew", budget=5.0, payload_snapshot=None, wire_registered=False)
+    await activate(
+        "sid",
+        "crew",
+        budget=5.0,
+        payload_snapshot=None,
+        wire_registered=False,
+        session_work_dir="/tmp",
+    )
 
     assert not terminated
     assert sent[0]["modeId"] == fresh.aliases["crew"]

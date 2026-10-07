@@ -1012,6 +1012,16 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "other harnesses already carry identity through their own projections.",
     (
         "src/kiro_crew/acp/runtime.py",
+        "_activate_mode_bracketed",
+    ): "The carried-deny activation reconcile mirrors the mount in "
+    "``_unpooled_control_planes``, which mounts the control-plane element only on "
+    "kiro. Another AGENT_SPEC backend (KAS) reaches this bracket and loads the same "
+    "spec but mounts no element, so its carried set is always empty; an unguarded "
+    "reconcile would read a by-name core grant with a disabledTools toggle as a deny "
+    "the empty set lacks and refuse a session that bypassed nothing. The positive "
+    "check keeps the reconcile where the carry mechanism exists.",
+    (
+        "src/kiro_crew/acp/runtime.py",
         "load_session",
     ): "KAS alone must have its custom agents re-attached on resume, and no harness "
     "property means 'this host needs its agent re-sent'. Adding one would cost the "

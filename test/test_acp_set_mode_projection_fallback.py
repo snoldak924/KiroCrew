@@ -143,9 +143,17 @@ async def _activate(rt: AcpRuntime, projection: NativeSkillProjection | None) ->
             return_value=projection,
         ),
         patch("kiro_crew.agent.require_unchanged_derived_spec", return_value=None),
+        # These projections carry aliases only (``specs`` is empty), so the
+        # carried-deny reconcile reads a ``None`` projected spec for "ops" and is a
+        # deterministic no-op -- this test is about the projection fallback.
     ):
         await rt._activate_mode_bracketed(
-            "s1", "ops", budget=5.0, payload_snapshot=None, wire_registered=True
+            "s1",
+            "ops",
+            budget=5.0,
+            payload_snapshot=None,
+            wire_registered=True,
+            session_work_dir="/tmp",
         )
 
 

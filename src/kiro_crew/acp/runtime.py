@@ -5952,6 +5952,132 @@ class AcpRuntime:
             "started. Start it again; if it keeps failing, restart the gateway."
         )
 
+    async def _refuse_carried_deny_bypass(
+        self,
+        mode_agent: str,
+        carried_denied: frozenset[tuple[str, str]],
+        session_work_dir: str | Path,
+        live_spec: dict[str, Any] | None,
+    ) -> None:
+        """Raise if the spec kiro-cli activates restricts a tool the gate does not.
+
+        The carried ``(server, tool)`` deny pairs were fixed when the mount was
+        composed, read from the spec THAT composition saw. The agent this bracket
+        activates can be a different -- or a since-edited -- spec, so what the mount
+        would decide for the LIVE spec can restrict more than the running session
+        enforces, and that gap leaves a switched-off tool reachable for the session:
+
+        * a ``disabledTools`` toggle added to a warm runtime's spec or settings AFTER
+          the mount read -- the live spec carries a deny ``carried_denied`` (which can
+          be empty) does not, yet the per-session element is already mounted, so
+          approving the tool runs it fail-open; or
+        * a toggle whose tool the live ``allowedTools`` auto-approves -- the mount's
+          predicate withholds the whole element for that server, but the running
+          session mounted it, so the switched-off tool is reachable on the auto-approve
+          path with no permission request to refuse.
+
+        Rather than re-derive either case with a second predicate, this re-runs the
+        mount's OWN predicate (:func:`kiro_control_plane_servers`) over the live spec
+        and the session's work dir, so the activation decision uses the one predicate,
+        the one source set, and the same ``allow.grants`` / spec-entry scoping the
+        mount applied -- an agent whose spec never grants an identity-bound server is
+        skipped by that predicate exactly as the mount skips it, so it is never
+        refused. The live verdict's ``carried`` pairs are what the gate SHOULD hold for
+        the live spec, and its ``withheld`` names servers the live spec would withhold.
+        The session is refused when the live verdict carries a pair the session's gate
+        does not, or withholds a server the session mounted (any pair carried for it in
+        the running session) -- either way the live spec restricts a tool the running
+        session leaves reachable. Settings that cannot be read are not a separate
+        branch here: the predicate withholds every identity-bound server for an
+        unreadable settings file, so an unreadable restriction refuses any server the
+        running session carries a pair for, through the same withheld path. The
+        fail-safe is to refuse: the session is not started, rather than started with a
+        governance toggle unenforced.
+
+        The caller runs this only on the kiro backend (``self.acp_backend ==
+        ACP_BACKEND_KIRO``), the positive identity gate the mount itself uses in
+        ``_unpooled_control_planes``: another ``AGENT_SPEC`` backend (e.g. KAS) reads
+        the same materialized spec and could grant ``kirocrew-core`` tools by name with
+        a ``disabledTools`` toggle standing, which this reconcile would read as a deny
+        the (always empty, off the kiro mount) carried set lacks and refuse a session
+        nothing mounted. The gate keeps the reconcile where the carry mechanism exists.
+
+        ``live_spec`` is the SAME ``spec_override`` the mount composed with -- the
+        PROJECTED spec, which injects ``kirocrew-core`` into a skill-enabled agent that
+        authored no entry for it -- read for ``session_work_dir`` (the per-session cwd
+        the mount used), NOT ``self._work_dir``: a shared runtime starting a child
+        project's session must reconcile against that child's spec and settings, not
+        the parent's, and against the projection the mount actually judged rather than
+        the authored spec, which would miss the injected server.
+
+        Read right before each send, so it covers the alias the loop finally sends --
+        the one projection prep selected and any a supersession re-pick swapped in --
+        and runs on EVERY start (including an empty carried set), because the empty set
+        is exactly the mid-life ``disabledTools`` fail-open above.
+
+        Raises ``AcpRuntimeError`` on a conflict; the bracket's own outer handler
+        terminates the already-created session, so this never tears it down itself --
+        doing so would terminate the session twice."""
+        from kiro_crew.acp.session_mcp import kiro_control_plane_servers
+
+        def _live_mount_verdict() -> tuple[frozenset[tuple[str, str]], frozenset[str]]:
+            """``(carried, withheld_names)`` the mount's predicate reaches for the live
+            spec.
+
+            Off the loop thread so the settings read does not pause the event loop.
+            Re-runs :func:`kiro_control_plane_servers` -- the SAME predicate the mount
+            composed with -- over the SAME ``spec_override`` the mount used (the
+            projected spec, which injects ``kirocrew-core`` into a skill-enabled agent
+            that authored no entry for it) and ``session_work_dir``'s settings, so the
+            verdict carries the mount's scoping (an agent granting no identity-bound
+            server yields an empty verdict), its injection, and its
+            auto-approve-withholds-the-element rule. Reconciling the AUTHORED spec
+            instead would miss the injected server and leave its disabled tool
+            reachable.
+
+            Settings that cannot be read are handled by the predicate itself: it
+            withholds every identity-bound server (a native restriction it cannot read
+            stays authoritative), which surfaces here as ``withheld_names`` and refuses
+            any server the running session carries a pair for -- so there is no
+            separate unreadable branch to raise."""
+            if not isinstance(live_spec, dict):
+                # No live spec to reconcile against (the mount's own predicate returns
+                # an empty verdict for the same input).
+                return frozenset(), frozenset()
+            mount = kiro_control_plane_servers(
+                mode_agent, work_dir=session_work_dir, spec_override=live_spec
+            )
+            # Every name in ``withheld`` is a server the live spec would NOT mount an
+            # element for (a disabledTools toggle it answers by withholding, or an
+            # unreadable settings file). A running session that mounted the element
+            # for such a server is now enforcing less than the live spec demands.
+            withheld_names = frozenset(mount.withheld)
+            return mount.carried, withheld_names
+
+        live_carried, live_withheld = await asyncio.to_thread(_live_mount_verdict)
+        # The live spec restricts a tool the running session leaves reachable when the
+        # mount's predicate would, for the live spec, carry a deny this session's gate
+        # does not hold, OR withhold a server this session carries a pair for (an
+        # auto-approved toggle the mount would answer by withholding the element).
+        session_servers = {server for server, _tool in carried_denied}
+        newly_carried = live_carried - carried_denied
+        newly_carried_servers = {server for server, _tool in newly_carried}
+        # A server the live spec would withhold but the running session carries a pair
+        # for is reported once (its ``*``), unless a specific newly-carried pair for
+        # that server already names it.
+        newly_withheld_servers = (live_withheld & session_servers) - newly_carried_servers
+        unenforced = newly_carried | {(server, "*") for server in newly_withheld_servers}
+        if not unenforced:
+            return
+        raise AcpRuntimeError(
+            f"Agent {mode_agent!r}: its live spec restricts a tool "
+            f"({', '.join(sorted(f'{s}/{t}' for s, t in unenforced))}) that this "
+            "session's per-call gate does not enforce (a disabledTools toggle landed, "
+            "or an allowedTools edit now auto-approves it, after the session's servers "
+            "were composed). The session was not started; start it again to pick it "
+            "up."
+        )
+
     async def _activate_mode_bracketed(
         self,
         session_id: str,
@@ -5960,6 +6086,8 @@ class AcpRuntime:
         budget: float,
         payload_snapshot: Any,
         wire_registered: bool,
+        session_work_dir: str | Path,
+        carried_denied: frozenset[tuple[str, str]] = frozenset(),
     ) -> None:
         """Send ``session/set_mode`` for *mode_agent* inside the derived-spec bracket.
 
@@ -6146,6 +6274,31 @@ class AcpRuntime:
                         missed = None
                 if sent_alias is not None:
                     self._refuse_if_view_unverified(mode_agent, used_generation)
+                # The spec kiro-cli activates is read here, right before the send,
+                # so the check covers the alias the loop finally sends -- the one
+                # projection prep selected and any the supersession re-pick above
+                # swapped in -- not the pre-prep spec read earlier in the bracket.
+                # Runs on every start, including a start whose gate carries nothing:
+                # a disabledTools toggle added to a warm runtime's spec AFTER the mount
+                # read leaves the gate empty while the element stands, and the live
+                # reconcile is the only reader that catches that.
+                #
+                # Gated to the kiro backend by the same positive identity check the
+                # mount uses in ``_unpooled_control_planes``: another AGENT_SPEC
+                # backend (e.g. KAS) reaches this bracket and loads the same spec, but
+                # mounts no control-plane element, so its carried set is always empty
+                # and an unguarded reconcile would refuse a session nothing bypassed.
+                # The spec reconciled is the PROJECTED one the mount judged (which
+                # injects kirocrew-core into a skill-enabled agent that authored no
+                # entry), not the authored spec -- reconciling the authored spec would
+                # miss the injected server.
+                if self.acp_backend == ACP_BACKEND_KIRO:
+                    live_spec = (
+                        projection_now.specs.get(mode_agent) if projection_now is not None else None
+                    )
+                    await self._refuse_carried_deny_bypass(
+                        mode_agent, carried_denied, session_work_dir, live_spec
+                    )
                 try:
                     await self._send_and_await(
                         METHOD_SET_MODE, wire, timeout=budget, **untranslated
@@ -6709,7 +6862,7 @@ class AcpRuntime:
 
     async def _unpooled_control_planes(
         self, entries: list[dict[str, Any]], agent: str | None, work_dir: str | Path
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], frozenset[tuple[str, str]]]:
         # A shared Kiro process has no session-valued environment. Its native
         # managed servers need per-element identity even with the broker off.
         if self.acp_backend == ACP_BACKEND_KIRO:
@@ -6729,6 +6882,28 @@ class AcpRuntime:
                 **projection_kwargs,
             )
             name = agent or self._agent
+            if (
+                projection is not None
+                and name in projection.search_agents
+                and ("kirocrew-core", "skill_search") in mount.carried
+            ):
+                # A search agent needs ``skill_search`` to reach its dropped
+                # resources. When a settings file switches ``skill_search`` off,
+                # the mount carries that pair on the gate and still emits the
+                # element -- so the session would start with the agent's skill
+                # resources already gone from the view and every ``skill_search``
+                # call refused by the gate, which is worse than a clean refusal.
+                # The spec-side refusal (below) covers a spec that drops
+                # ``skill_search``; this covers the settings-file toggle, which
+                # reaches the same tool by the carry path. Refuse the session
+                # with the message that names the file and the way back.
+                withheld = mount.withheld.get("kirocrew-core")
+                detail = (
+                    withheld.explain("skill search")
+                    if withheld is not None
+                    else "skill_search is switched off for this agent in the MCP settings"
+                )
+                raise AcpRuntimeError(f"Agent {name!r}: {detail}")
             if (
                 projection is not None
                 and name in projection.search_agents
@@ -6752,6 +6927,15 @@ class AcpRuntime:
                 # this agent's skill resources on the element's promise, and
                 # without the element kirocrew-core mounts natively, carries no
                 # identity and answers identity_unattested to every skill_search.
+                #
+                # A ``disabledTools`` toggle on kirocrew-core that the backend
+                # prompts for rides the per-call gate, so the mount emits the
+                # element and carries the pair -- the element IS in
+                # ``mount.elements`` and this branch is not taken for it. A
+                # restriction with no per-call form -- a mute, a non-stdio
+                # transport, a key the element cannot express, or a toggled tool
+                # the spec's ``allowedTools`` auto-approves -- keeps the element
+                # withheld, so refusing stays the only honest answer for those.
                 withheld = mount.withheld.get("kirocrew-core")
                 if withheld is not None:
                     raise AcpRuntimeError(f"Agent {name!r}: {withheld.explain('skill search')}")
@@ -6760,8 +6944,8 @@ class AcpRuntime:
                         "Cannot bind skill_search to this session without losing native MCP "
                         "restrictions. Check the agent's kirocrew-core server configuration."
                     )
-            return [*entries, *mount.elements]
-        return entries
+            return [*entries, *mount.elements], mount.carried
+        return entries, frozenset()
 
     @staticmethod
     async def _source_agent(agent: str | None) -> str | None:
@@ -6895,9 +7079,18 @@ class AcpRuntime:
                     self.acp_backend,
                     session_work_dir,
                 )
-                mcp_servers = await self._unpooled_control_planes(
+                mcp_servers, carried_denied = await self._unpooled_control_planes(
                     pooled, agent or self._agent, session_work_dir
                 )
+                # On the kiro backend a ``disabledTools`` toggle on the control
+                # plane is carried on the per-call gate rather than withholding
+                # the element and refusing the session. The pairs land
+                # on this session's ``spec_denied_tools`` the same way a mirrored
+                # host's do -- the handle refuses a switched-off tool at the
+                # permission request -- so the session runs minus the toggled
+                # tool and keeps skill_search. Empty on every other backend and
+                # whenever nothing is toggled.
+                denied_tools = carried_denied
                 mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         else:
             # An explicit array is the caller's own composition (a mirror's
@@ -7482,6 +7675,8 @@ class AcpRuntime:
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
+                session_work_dir=session_work_dir,
+                carried_denied=denied_tools,
             )
             handle.active_agent = mode_agent
             # Whether set_mode actually SWITCHED modes: the servers that
@@ -7790,9 +7985,13 @@ class AcpRuntime:
                 self.acp_backend,
                 session_work_dir,
             )
-            mcp_servers = await self._unpooled_control_planes(
+            mcp_servers, carried_denied = await self._unpooled_control_planes(
                 pooled, active_agent, session_work_dir
             )
+            # Carry a control-plane ``disabledTools`` toggle on the gate here too,
+            # so a RESUMED session keeps the same deny set a fresh one gets and
+            # the toggled tool stays refused across session/load.
+            denied_tools = carried_denied
             mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         member_withheld = False
         # Whether the member session-control entry is IN the array, the one fact
@@ -8045,6 +8244,8 @@ class AcpRuntime:
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
+                session_work_dir=session_work_dir,
+                carried_denied=denied_tools,
             )
             handle.active_agent = mode_agent
             # See create_session: after a real mode switch, registration frames
