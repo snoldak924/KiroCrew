@@ -24,6 +24,7 @@ from typing import Awaitable, Callable
 
 from kiro_crew.agent_discovery import is_internal_agent_spec, list_agents
 from kiro_crew.sel import sel
+from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,29 @@ SpawnImpl = Callable[[str, str, bool, str, str], Awaitable[str]]
 
 
 class SpawnError(RuntimeError):
-    """The host declined or could not start the requested agent."""
+    """The host declined or could not start the requested agent.
+
+    ``declined`` separates two kinds of failure. ``True`` is a HOST-PRESSURE
+    decline — the admission gate had no capacity to START this spawn and did not
+    accept it either: it refused with a memory wait reason it had no durable row
+    to park (``build_spawn_impl`` recognises the gate's own
+    ``DEFERRED_QUEUED_REASONS``), or it returned nothing at all (an empty id). A
+    caller may treat this as a back-off signal. ``False`` is a programming or
+    impl fault (empty task, empty agent, a normalised impl exception, or any
+    other refusal) that no amount of waiting fixes.
+
+    An accepted-but-deferred spawn is NOT a decline and raises nothing: the gate
+    returns a queued record with a real id, so ``build_spawn_impl`` hands that id
+    back like any other accepted spawn. The caller must treat a returned id as
+    in flight (queued or running) and not re-submit it.
+
+    A caller that backed off on the whole exception type would pause on faults
+    too, so the flag is the signal to gate on — not ``isinstance``.
+    """
+
+    def __init__(self, *args: object, declined: bool = False) -> None:
+        super().__init__(*args)
+        self.declined = declined
 
 
 #: Optional probe the gateway injects alongside the impl:
@@ -126,7 +149,8 @@ class SpawnSDK:
         if not spawn_id:
             raise SpawnError(
                 f"host declined the spawn for app {self._app_name!r} "
-                f"(agent={agent or 'default'!r})"
+                f"(agent={agent or 'default'!r})",
+                declined=True,
             )
         logger.info(
             "App %s spawned background agent %s (id=%s, silent=%s)",
@@ -214,7 +238,15 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
         if info is None:
             return ""
         if getattr(info, "error", ""):
-            raise SpawnError(str(info.error))
+            # A done record carrying ``error`` is a refusal, not a started run.
+            # The admission gate refuses a memory wait it has no durable row to
+            # park with a ``queued_reason`` from its own deferred set
+            # (``low_memory`` / ``memory_pressure``) — that is the host-pressure
+            # DECLINE this flags for back-off. Every
+            # other error (empty/unknown agent, bad cwd, governance, a store
+            # outage) is a fault no cooldown fixes and raises undeclined.
+            declined = str(getattr(info, "queued_reason", "")) in DEFERRED_QUEUED_REASONS
+            raise SpawnError(str(info.error), declined=declined)
         return str(getattr(info, "id", "") or "")
 
     # Ride the probe on the impl callable rather than adding a second parameter
