@@ -42,7 +42,7 @@
  */
 import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Sparkles, Square, Star, Users, X, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Square, Star, Users, X, Zap } from 'lucide-react'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { PanelRightSolid } from '../../components/icons/panels'
@@ -104,7 +104,7 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 import { markSlotRead } from '../../store/dashboardSlice'
 import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
 import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
-import CrewAvatar from '../../components/CrewAvatar'
+import CrewAvatar, { seededTraits } from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import CrewLoopIndicator from '../../components/crew/CrewLoopIndicator'
 import Glass from '../../components/Glass'
@@ -127,8 +127,6 @@ import { mergePaneDraft } from '../../utils/chatPaneDrafts'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useConfirm } from '../../components/ConfirmDialog'
-import { CREWMATES_PAGE_ENTERED_EVENT, START_MEET_CREWMATES_EVENT } from '../../components/MeetCrewmatesFlow'
-import { hasNoCrewmates } from '../../hooks/useMeetCrewmatesGate'
 import { useGuardedLeave, usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
 import CrewNotesTab from './CrewNotesTab'
 import { useIsMobile } from '../../hooks/useIsMobile'
@@ -734,7 +732,15 @@ function CrewmateEmptyHero({ onCreate, held }: {
   const { t } = useTranslation()
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 py-10 text-center animate-rise" data-testid="crewmate-empty-hero">
-      <div className="mb-1 opacity-90"><CrewAvatar seed="crewmate" size={72} /></div>
+      {/* The intro's ghost lands here when the page opens on no chat (the New
+          tag's path); the tile colour shows the tile empty until it arrives. */}
+      <div
+        className="mb-1 opacity-90 rounded-md"
+        data-feature-landing="members"
+        data-feature-landing-tile={seededTraits('crewmate').tile}
+      >
+        <CrewAvatar seed="crewmate" size={72} />
+      </div>
       <div className="text-[17px] font-semibold text-text-strong" data-testid="crewmate-empty-title">{t('pages.membersPage.empty_title')}</div>
       <p className="m-0 max-w-[400px] text-[13.5px] leading-relaxed text-muted">{t('pages.membersPage.empty_body')}</p>
       <Btn
@@ -751,6 +757,11 @@ function CrewmateEmptyHero({ onCreate, held }: {
       </Btn>
     </div>
   )
+}
+
+/** No crewmate beyond the always-present `default` row (the main assistant). */
+function hasNoCrewmates(rows: readonly Pick<MemberRosterRow, 'name'>[] | undefined): boolean {
+  return Array.isArray(rows) && rows.every(r => r.name === 'default')
 }
 
 export default function MembersPage() {
@@ -778,13 +789,6 @@ export default function MembersPage() {
   )
   const loaded = rosterQuery.data !== undefined || rosterQuery.isError
   const loadError = rosterQuery.data === undefined && rosterQuery.isError
-  // Ask the host to show Meet CrewMates on the first visit. The host decides
-  // whether it is still due (whether this workspace has seen it, nothing
-  // else), so announcing on every mount is safe; the empty-state button stays
-  // the on-demand entry.
-  useEffect(() => {
-    window.dispatchEvent(new Event(CREWMATES_PAGE_ENTERED_EVENT))
-  }, [])
   // ONE source of truth for the roster fields the page derives from (starred
   // count, the Starred filter, search, sort, source chips): the react-query
   // rows merged with each member's pushed `roster` projection, projection
@@ -3441,26 +3445,6 @@ export default function MembersPage() {
               <CrewmateEmptyHero onCreate={() => setCreateOpen(true)} held={createHeld} />
             </li>
           )}
-          {loaded && !loadError && hasNoCrewmates(members) && (
-            /* The on-demand Meet CrewMates entry, beside the empty state
-               (the built-in `default` row is the main assistant, not a
-               crewmate). Re-opens the first-run flow (App hosts it) — the user
-               asked, so no check applies. */
-            <li className="px-4 py-2">
-              <button
-                onClick={() => window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))}
-                className="inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
-                data-testid="member-meet-crewmates"
-              >
-                <Sparkles className="lucide-inline" />
-                {t('pages.membersPage.meet_crewmates')}
-              </button>
-              {/* A block line under the button, never an inline tail: beside the
-                  button the gloss wrapped mid-phrase in the narrow sidebar and
-                  read as part of the control. */}
-              <p className="mt-1 text-[11px] text-muted">{t('pages.membersPage.meet_crewmates_hint')}</p>
-            </li>
-          )}
           {loadError && (
             /* The shared notice, not a bare alert: a read failure on a list
                that holds no draft, so the agent hand-off is safe here. Below
@@ -3755,7 +3739,9 @@ export default function MembersPage() {
                     no scrim, no badge (issue #9425). */}
                 {/* The face is a shared layout element: when the card docks and the
                     pill steps out, the same face slides into the card's head. */}
-                <motion.span layoutId={CREW_FACE_LAYOUT_ID} className="relative flex shrink-0 rounded-full">
+                {/* The Crewmates intro's "Try it" opens default's chat, and its
+                    ghost lands on this face. */}
+                <motion.span layoutId={CREW_FACE_LAYOUT_ID} className="relative flex shrink-0 rounded-full" data-feature-landing="members">
                   <CrewStateAvatar
                     seed={active.name}
                     avatar={active.avatar}
