@@ -9932,7 +9932,12 @@
       "session_approval_confirm_title": "Autoriser « {{name}} » à contrôler tes chats ?",
       "session_approval_reconsent_notice": "{{name}} est désactivée, car elle demande maintenant à contrôler tes chats. Vérifie l’autorisation sur cette page avant de l’activer.",
       "approve_new_permissions": "Approuver les nouvelles autorisations",
-      "grants_reconsent_notice": "{{name}} demande de nouvelles autorisations dans cette version : {{entries}}. Elles restent désactivées, et l’app garde ses autorisations précédentes, jusqu’à ce que tu les approuves."
+      "grants_reconsent_notice": "{{name}} continue de fonctionner avec les autorisations que tu as déjà approuvées. Cette version demande aussi celles ci-dessous ; elles restent désactivées jusqu’à ce que tu les approuves. Ignore ce message pour garder l’app avec ses autorisations actuelles. Une fois approuvées, tu ne peux les retirer qu’en désactivant l’app.",
+      "grants_reconsent_notice_disabled": "{{name}} est désactivée. Active-la, puis approuve ici ces nouvelles autorisations ; d’ici là, elle n’utilise que les autorisations que tu as déjà approuvées.",
+      "grant_not_approved": "non approuvée",
+      "grants_reconsent_api": "Accès à l’API : permet à l’app d’appeler ces chemins de l’API Kiro Crew avec son propre jeton.",
+      "grants_reconsent_events": "Événements WebSocket : permet à l’app de recevoir ou d’envoyer ces événements du tableau de bord en temps réel.",
+      "grants_approved": "Approuvées : {{entries}}. L’app peut les utiliser maintenant. Pour que l’app cesse d’utiliser ses autorisations, désactive-la."
     },
     "appPage": {
       "loading_app": "Chargement de l'application…",

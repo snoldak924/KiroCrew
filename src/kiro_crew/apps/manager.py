@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import urlparse
 
 from kiro_crew import platform_compat
@@ -164,6 +164,10 @@ class InstalledApp:
     # running, and the gate enforces live-declared entries that are also in this
     # set, until the owner approves the new ones. Empty means nothing is staged.
     consentedGrants: dict[str, list[str]] = dataclass_field(default_factory=dict)  # noqa: N815
+    # A fresh random value on every record write, so two reads of the record
+    # agree only when nothing wrote it in between -- even a write that restores
+    # every other field. Left out of equality: it identifies a write, not state.
+    writeNonce: str = dataclass_field(default="", compare=False)  # noqa: N815
 
     def validate_fields(self) -> list[str]:
         """Validate classification field values. Returns error list (empty = valid)."""
@@ -201,7 +205,12 @@ class InstalledApp:
             sourceCommit=str(data.get("sourceCommit", "")),
             sourceSigner=str(data.get("sourceSigner", "")),
             sessionApprovalConsentPending=bool(data.get("sessionApprovalConsentPending", False)),
-            consentedGrants=_parse_consented_grants(data.get("consentedGrants")),
+            consentedGrants=(
+                _parse_consented_grants(data["consentedGrants"])
+                if "consentedGrants" in data
+                else {}
+            ),
+            writeNonce=str(data.get("writeNonce", "")),
         )
         # Migrate old "managed" field to new classification fields
         if inst.schemaVersion < 2 and "origin" not in data:
@@ -288,6 +297,7 @@ def _write_installed(name: str, meta: InstalledApp) -> None:
 
     credential_free_meta = replace(
         meta,
+        writeNonce=os.urandom(8).hex(),
         source=_credential_free_source_metadata(str(meta.source or "")),
         sourceUrl=_strip_git_target_userinfo(str(meta.sourceUrl or "")),
         sourceRegistry=_credential_free_source_metadata(str(meta.sourceRegistry or "")),
@@ -303,14 +313,13 @@ STAGED_GRANT_FAMILIES = ("api", "events")
 
 
 def _parse_consented_grants(raw: Any) -> dict[str, list[str]]:
-    """Read a persisted ``consentedGrants`` record, failing closed.
+    """Read a PRESENT ``consentedGrants`` value, failing closed.
 
-    Absent or empty means nothing is staged. A record that is present but
-    malformed is still a staged record: it reads as an empty consented set, so
-    the app is held to nothing it declares rather than to everything.
+    Only an absent key means nothing is staged (the writer drops the key
+    rather than writing an empty value). A present value of any shape is a
+    staged record, and anything but a mapping reads as an empty consented set,
+    so the app is held to nothing it declares rather than to everything.
     """
-    if not raw:
-        return {}
     record = raw if isinstance(raw, dict) else {}
     parsed: dict[str, list[str]] = {}
     for family in STAGED_GRANT_FAMILIES:
@@ -358,18 +367,26 @@ def _staged_grants_after_manifest_change(
     return {}
 
 
-def staged_app_grants(name: str, family: str, declared: Sequence[str]) -> list[str]:
-    """Filter *declared* ``permissions.<family>`` entries to what the owner approved.
+def _update_marker(name: str) -> Path:
+    """Sibling of the app tree, present while ``update_app`` swaps that tree."""
+    return app_dir(name).parent / f".{name}-updating"
 
-    The enforcement points (``token_auth._app_api_allowlist``,
-    ``ws_event_scope._read_declared_events``) read the live manifest; this keeps
-    a staged widening out of it. An app with nothing on disk holds nothing
-    staged, so the declared entries pass unchanged (callers gate on installation
-    themselves). An app directory without a readable record -- a corrupt record,
-    or an update between moving the old tree aside and writing the new record --
-    is not evidence of approval, so it yields nothing.
-    """
-    meta = _read_installed(name)
+
+def _clear_update_marker(marker: Path) -> None:
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove update marker %s", marker, exc_info=True)
+
+
+# How many times a grant read retries when the install record changed under it
+# before it gives up and grants nothing (see ``staged_app_grants``).
+_STAGED_GRANT_READ_ATTEMPTS = 3
+
+
+def _staged_filter(
+    name: str, meta: InstalledApp | None, family: str, declared: Sequence[str]
+) -> list[str]:
     if meta is None:
         root = app_dir(name)
         if (root / INSTALLED_META_FILENAME).exists() or (root / APP_MANIFEST_FILENAME).exists():
@@ -381,22 +398,64 @@ def staged_app_grants(name: str, family: str, declared: Sequence[str]) -> list[s
     return [entry for entry in declared if entry in approved]
 
 
+def staged_app_grants(
+    name: str, family: str, read_declared: Callable[[], Sequence[str] | None]
+) -> list[str]:
+    """Read *name*'s declared ``permissions.<family>`` entries, minus staged ones.
+
+    The enforcement points (``token_auth._app_api_allowlist``,
+    ``ws_event_scope._read_declared_events``, the hook context) read the live
+    manifest; this keeps a staged widening out of it. *read_declared* reads the
+    manifest (``None`` when there is none) and is called BETWEEN two reads of
+    the install record: the manifest and the record are separate files that
+    updates and registrations write one after the other, so a manifest read is
+    only paired with a record that did not change around it. A record that keeps
+    changing grants nothing.
+
+    An app with nothing on disk holds nothing staged, so the declared entries
+    pass unchanged (callers gate on installation themselves). An app directory
+    without a readable record -- a corrupt record, or an update between moving
+    the old tree aside and writing the new record -- is not evidence of
+    approval, so it yields nothing.
+    """
+    marker = _update_marker(name)
+    for _ in range(_STAGED_GRANT_READ_ATTEMPTS):
+        swapping = marker.exists()
+        before = _read_installed(name)
+        declared = read_declared()
+        after = _read_installed(name)
+        swapping = swapping or marker.exists()
+        if not swapping and before == after and (
+            before is None or (after is not None and before.writeNonce == after.writeNonce)
+        ):
+            if declared is None:
+                return []
+            return _staged_filter(name, after, family, declared)
+    logger.warning("app %s: install record kept changing; granting no %s entries", name, family)
+    return []
+
+
 def approved_manifest_permissions(app_info: dict[str, Any]) -> dict[str, Any]:
     """``app_info``'s manifest permissions with staged api/events entries removed.
 
-    For the hook-context builders, which read a ``get_app``/``list_apps`` row
-    rather than the disk, so the staged record travels in the same row.
+    For the hook-context builders, which start from a ``get_app``/``list_apps``
+    row. The row's api/events lists and its record are not read together, so
+    both are re-read through ``staged_app_grants`` instead of trusted.
     """
+    name = str(app_info.get("name", ""))
     manifest = app_info.get("manifest") or {}
     permissions = dict(manifest.get("permissions") or {})
-    consented = _parse_consented_grants(app_info.get("consentedGrants"))
-    if not consented:
-        return permissions
     for family in STAGED_GRANT_FAMILIES:
-        if family in permissions:
-            approved = set(consented[family])
-            entries = permissions[family] if isinstance(permissions[family], list) else []
-            permissions[family] = [e for e in entries if e in approved]
+        if family not in permissions:
+            continue
+
+        def _read(family: str = family) -> list[str] | None:
+            live = get_app_manifest(name)
+            if live is None:
+                return None
+            return [e for e in getattr(live.permissions, family) if e]
+
+        permissions[family] = staged_app_grants(name, family, _read)
     return permissions
 
 
@@ -1381,6 +1440,17 @@ def update_app(
     if tmp_secret.is_file() and secret_file.is_file():
         tmp_secret.unlink()
 
+    # The record lives inside the tree this swaps, so between moving the old
+    # tree aside and the new record (or the rollback) landing, no record
+    # describes the manifest on disk. The marker outside the tree says so to
+    # every grant read (see ``staged_app_grants``); it is kept on a failed
+    # rollback, which then grants no api/events entry.
+    marker = _update_marker(name)
+    try:
+        marker.write_text("", encoding="utf-8")
+    except OSError as exc:
+        return AppResult(ok=False, name=name, error=f"failed to update app files: {exc}")
+
     try:
         if _owned_data_dir(data_dir):
             shutil.move(str(data_dir), str(tmp_data))
@@ -1436,11 +1506,14 @@ def update_app(
         except (OSError, shutil.Error, ValueError) as rollback_exc:
             rollback_error = f"; rollback failed: {rollback_exc}"
             logger.error("Failed to restore app %s after update error", name, exc_info=True)
+        if not rollback_error:
+            _clear_update_marker(marker)
         return AppResult(
             ok=False,
             name=name,
             error=f"failed to update app files: {exc}{rollback_error}",
         )
+    _clear_update_marker(marker)
 
     try:
         _remove_any_shape(retired)
@@ -2332,12 +2405,16 @@ def enable_app(
     name: str,
     *,
     session_approval_consent: bool = False,
-    grants_consent: bool = False,
+    grants_consent: dict[str, list[str]] | None = None,
 ) -> AppResult:
     """Enable an installed app.
 
-    ``grants_consent`` approves staged ``permissions.api``/``events`` entries
-    (see ``consentedGrants``). Without it the app is enabled on the approved set.
+    ``grants_consent`` names the staged ``permissions.api``/``events`` entries
+    the owner was shown and approved (see ``consentedGrants``). Only those, and
+    only while the live manifest still declares them, join the approved set; an
+    entry added after the owner looked stays staged. Without it the app is
+    enabled on the approved set. Callers hold ``app_lifecycle_lock(name)``, so
+    no update or registration lands between this read and its write.
     """
     if not _check_path_safety(name):
         return AppResult(ok=False, name=name, error=f"unsafe app name: {name!r}")
@@ -2393,16 +2470,36 @@ def enable_app(
             error_code="session_approval_consent_required",
         )
 
-    approve_grants = grants_consent and bool(meta.consentedGrants)
+    approve_grants = grants_consent is not None and bool(meta.consentedGrants)
     if meta.enabled and not approve_grants:
         return AppResult(ok=True, name=name, message=f"{name} is already enabled")
 
-    if approve_grants:
-        meta.consentedGrants = {}
+    still_staged = False
+    if approve_grants and grants_consent is not None:
+        live = get_app_manifest(name)
+        if live is None or _update_marker(name).exists():
+            # An unreadable manifest is not "declares nothing": approving
+            # against it would clear the record and grant whatever it declares
+            # once readable. Refuse and leave the record as it is.
+            return AppResult(
+                ok=False,
+                name=name,
+                error="the app manifest cannot be read right now; try approving again",
+                error_code="grants_manifest_unreadable",
+            )
+        declared = _declared_grant_entries(live.permissions)
+        approved: dict[str, list[str]] = {}
+        for family in STAGED_GRANT_FAMILIES:
+            shown = {e for e in grants_consent.get(family, ()) if isinstance(e, str)}
+            kept = list(meta.consentedGrants.get(family, ()))
+            kept += [e for e in declared[family] if e in shown and e not in kept]
+            approved[family] = kept
+            still_staged = still_staged or any(e not in kept for e in declared[family])
+        meta.consentedGrants = approved if still_staged else {}
         sel().log_api_access(
             caller="app_enable",
             operation="grants_approved",
-            outcome="success",
+            outcome="partial" if still_staged else "success",
             resources=f"name={name!r}",
         )
     meta.enabled = True
@@ -2411,7 +2508,13 @@ def enable_app(
     _write_installed(name, meta)
 
     logger.info("Enabled app %s", name)
-    return AppResult(ok=True, name=name, message=f"enabled {name}")
+    return AppResult(
+        ok=True,
+        name=name,
+        message=f"enabled {name}",
+        # Entries declared after the owner looked are still waiting.
+        notice="grants_reconsent" if still_staged else "",
+    )
 
 
 def disable_app(name: str) -> AppResult:
@@ -2465,9 +2568,9 @@ def list_apps() -> list[dict[str, Any]]:
                 # callers run it concurrently from worker threads, and a
                 # persisted read-modify-write of installed.json from a
                 # listing would race real mutators (install/enable/
-                # register) and silently overwrite their fields. The
-                # durable repair happens on the single-app paths
-                # (get_app / update_app).
+                # register) and silently overwrite their fields. get_app
+                # is read-only for the same reason; the record's version is
+                # rewritten by update_app / register_external_app.
                 if (
                     meta.lifecycle == "app"
                     and manifest.version
@@ -2501,11 +2604,13 @@ def get_app(name: str) -> dict[str, Any] | None:
         try:
             manifest = AppManifest.from_json_file(manifest_path)
             manifest_data = manifest.to_dict()
-            # Sync version for self-managed apps (same as list_apps)
+            # Reflect a self-managed app's own manifest version in the RETURNED
+            # row only, as list_apps does. The record here was read before the
+            # manifest, so writing it back would overwrite whatever a
+            # registration landing between the two reads stored -- a staged
+            # consentedGrants, a disable-for-consent -- with the stale snapshot.
             if meta.lifecycle == "app" and manifest.version and manifest.version != meta.version:
                 meta.version = manifest.version
-                meta.updatedAt = _now_iso()
-                _write_installed(name, meta)
         except Exception:
             pass
     return {**meta.to_dict(), "manifest": manifest_data}

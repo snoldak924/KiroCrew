@@ -663,9 +663,41 @@ describe('AppDetailPage — uncovered surfaces', () => {
     renderDetail()
     await loaded()
 
-    expect(screen.getByText(/requests new permissions in this version: \/api\/memory, log\./)).toBeInTheDocument()
+    const notice = screen.getByText(/keeps running on the permissions you already approved/).closest('[role="status"]') as HTMLElement
+    expect(notice).not.toBeNull()
+    expect(within(notice).getByText(/API access: lets the app call/)).toBeInTheDocument()
+    expect(within(notice).getByText('/api/memory')).toBeInTheDocument()
+    expect(within(notice).getByText(/WebSocket events: lets the app receive or send/)).toBeInTheDocument()
+    expect(within(notice).getByText('log')).toBeInTheDocument()
+    expect(within(notice).queryByText('/api/sessions')).not.toBeInTheDocument()
+    expect(notice.textContent).toContain('Ignore this to keep the app on its current permissions.')
+    expect(notice.textContent).toContain('can only be taken back by disabling the app')
+    // The Permissions card marks the held-back entries, and only those.
+    expect(screen.getAllByText(/not approved/)).toHaveLength(2)
+    getApp.mockResolvedValue(installedApp({
+      manifest: {
+        displayName: 'Ledger Lens',
+        permissions: { api: ['/api/sessions', '/api/memory'], events: ['slots:own', 'log'] },
+      },
+    }))
     fireEvent.click(screen.getByRole('button', { name: 'Approve new permissions' }))
-    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, false, true))
+    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, false, { api: ['/api/memory'], events: ['log'] }))
+    expect(await screen.findByText('Approved: /api/memory, log. The app can use them now. To stop the app using any of its permissions, disable it.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Approve new permissions' })).not.toBeInTheDocument()
+  })
+
+  it('offers no approval on a disabled app, whose enable would switch it on', async () => {
+    getApp.mockResolvedValue(installedApp({
+      enabled: false,
+      manifest: { displayName: 'Ledger Lens', permissions: { api: ['/api/sessions', '/api/memory'] } },
+      consentedGrants: { api: ['/api/sessions'], events: [] },
+    }))
+    renderDetail()
+    await loaded()
+
+    expect(screen.getByText(/is off\. Enable it, then approve these new permissions here/)).toBeInTheDocument()
+    expect(screen.queryByText(/keeps running on the permissions you already approved/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Approve new permissions' })).not.toBeInTheDocument()
   })
 
   it('shows no staged-permission notice when nothing is staged', async () => {

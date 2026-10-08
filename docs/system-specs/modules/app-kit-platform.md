@@ -1587,12 +1587,37 @@ that adds any entry to either is staged rather than disabled: `update_app` and
 every enforcement point -- `token_auth._app_api_allowlist`,
 `ws_event_scope._read_declared_events`, and the hook context's event bus via
 `approved_manifest_permissions` -- grants only declared entries that are also in
-that set (`staged_app_grants`). A later update keeps the original baseline, and
+that set (`staged_app_grants`). The manifest and `installed.json` are separate
+files written one after the other, so `staged_app_grants` reads the manifest
+between two reads of the record and uses it only when the record did not change
+around it (three tries, then nothing is granted); every record write stamps a
+fresh random `writeNonce`, so a write that restores every other field still
+reads as a change. `get_app` is read-only, like
+`list_apps`, so a detail fetch cannot write back a record it read before a
+registration staged it. The approved event set is part of `hook_signature`, so
+approving staged events makes the hook reconciler reload the app and rebuild its
+event bus. A later update keeps the original baseline, and
 one back inside it clears the record. The detail page lists the held-back entries
-and its "Approve new permissions" button posts `/enable` with `grantsConsent:
-true` (owner-gated), which clears the record; the caches pick it up within their
-refresh interval. Failure direction is closed: an unreadable old manifest gives an
-empty baseline, a malformed `consentedGrants` record approves nothing, and an app
+under "API access" and "WebSocket events" (the Permissions card's labels) with a
+plain-words gloss for each group, says approval is undone only by disabling the
+app, and on a disabled app says to enable it first. Its "Approve new
+permissions" button posts `/enable` with `grantsConsent:
+{"api": [...], "events": [...]}` naming the entries the owner was shown
+(owner-gated; any other value approves nothing). Under the lifecycle lock,
+`enable_app` adds only those entries, and only while the live manifest still
+declares them, to the approved set; an entry declared after the owner looked
+stays staged (`notice: "grants_reconsent"`), and the record clears once nothing
+is left. `update_app` writes a `.<name>-updating` marker beside the app tree for
+the whole tree swap and any rollback, and every grant read made while it exists
+grants nothing (a failed rollback leaves it, failing closed). `enable_app`
+refuses an approval with `grants_manifest_unreadable`, leaving the record as it
+is, while the manifest cannot be read or the update marker exists. An approval
+shows an "Approved: ..." confirmation; the API and WebSocket caches pick it up within their refresh
+interval. The button is offered only while the app is enabled, because the
+enable route would also switch a disabled app on; a disabled app enabled first
+runs on the approved set and the notice stays. Failure direction is closed: an unreadable old manifest gives an
+empty baseline, a `consentedGrants` key that is present but not a non-empty
+mapping (any shape, including `[]`, `false` or `{}`) approves nothing, and an app
 directory with no readable record (corrupt, or mid-update between the tree swap
 and the new record) grants no `permissions.api` entry.
 

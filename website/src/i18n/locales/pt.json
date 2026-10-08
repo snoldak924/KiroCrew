@@ -9932,7 +9932,12 @@
       "session_approval_confirm_title": "Permitir que “{{name}}” controle seus chats?",
       "session_approval_reconsent_notice": "{{name}} está desativado porque passou a pedir para controlar seus chats. Revise a permissão nesta página antes de ativá-lo.",
       "approve_new_permissions": "Aprovar novas permissões",
-      "grants_reconsent_notice": "{{name}} pede novas permissões nesta versão: {{entries}}. Elas ficam desativadas, e o app mantém as permissões anteriores, até você aprová-las."
+      "grants_reconsent_notice": "{{name}} continua funcionando com as permissões que você já aprovou. Esta versão também pede as abaixo; elas ficam desativadas até você aprová-las. Ignore isto para manter o app com as permissões atuais. Depois de aprovadas, só podem ser revogadas desativando o app.",
+      "grants_reconsent_notice_disabled": "{{name}} está desativado. Ative-o e depois aprove aqui estas novas permissões; até lá, ele usa só as permissões que você já aprovou.",
+      "grant_not_approved": "não aprovada",
+      "grants_reconsent_api": "Acesso à API: permite que o app chame estes caminhos da API do Kiro Crew com o próprio token.",
+      "grants_reconsent_events": "Eventos WebSocket: permite que o app receba ou envie estes eventos do painel em tempo real.",
+      "grants_approved": "Aprovadas: {{entries}}. O app já pode usá-las. Para o app parar de usar as permissões, desative-o."
     },
     "appPage": {
       "loading_app": "Carregando app…",
