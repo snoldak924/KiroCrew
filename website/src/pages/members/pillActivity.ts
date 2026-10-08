@@ -125,3 +125,15 @@ export function resolvePillActivity(input: PillActivityInput): PillActivity {
       return { kind: delegatedOnly ? 'delegated' : 'working' }
   }
 }
+
+/** Catalog keys for the phases that carry no text of their own. `tool` and
+ *  `thinking` carry `text`; `idle` is the host's to phrase (the pill adds the
+ *  resting age). */
+export const PILL_ACTIVITY_KEY: Record<Exclude<PillActivityKind, 'tool' | 'thinking'>, string> = {
+  writing: 'pages.membersPage.pill_writing',
+  compacting: 'pages.membersPage.pill_compacting',
+  stopping: 'pages.membersPage.pill_stopping',
+  working: 'pages.membersPage.drawer_working',
+  delegated: 'pages.membersPage.drawer_delegated_working',
+  idle: 'pages.membersPage.pill_idle',
+}
