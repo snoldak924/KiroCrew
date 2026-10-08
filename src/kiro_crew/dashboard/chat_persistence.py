@@ -38,7 +38,7 @@ import re
 import threading
 import time
 from collections import OrderedDict, deque  # noqa: F401
-from collections.abc import Iterable, Iterator, Mapping  # noqa: F401
+from collections.abc import Iterable, Iterator, Mapping, Sequence  # noqa: F401
 from itertools import chain, islice  # noqa: F401
 from pathlib import Path
 from typing import Any
@@ -511,7 +511,10 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
     """
     if not state.conversation_log:
         return
-    keys = _read_open_slots_keys()
+    keys, known = _read_open_slots_snapshot()
+    # An unknown set must not license the latch its caller flips, so say so before
+    # returning: an unreadable registry is not an empty one.
+    state.open_slots_knowable = known
     if not keys:
         return
     restored = 0
@@ -520,66 +523,163 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
     # off the class-level frozenset baseline.
     unrestored: set[str] = set()
     state.unrestored_slot_keys = unrestored
+    # The subset a reader is told about -- see _apply_restored_open_slot.
+    dropped: set[str] = set()
     # Read once per restore: whether this boot's authority pair came from a
     # remote snapshot whose transcripts are fetched lazily (see
     # _transcripts_may_be_remote_only).
     preserve_remote_only = _transcripts_may_be_remote_only()
     # Built once and shared across every tab — it is identical per slot.
     kiro_model_map = _build_kiro_model_map()
-    for raw in keys:
-        key = _sanitize_open_slot_key(raw)
-        if key is None or key in state._slots:
-            continue
-        try:
-            # Ask whether the metadata READ succeeded, not just whether it came
-            # back empty (``with_status``) — see _prefetch_rehydrate_inputs.
-            #
-            # These reads MUST stay inside the per-tab guard. The async driver
-            # has no except at its call site either, so anything escaping here
-            # aborts dashboard startup and costs every LATER tab too.
-            meta, readable, messages, model_map, member_identity, agent, effort_marker = (
-                _prefetch_rehydrate_inputs(
-                    state.conversation_log,
-                    slot_transcript_key(key),
-                    kiro_model_map=kiro_model_map,
-                    with_status=True,
+    # Which key the loop is on, so an abort can name the ones it never read. A
+    # generator is ABANDONED by a GeneratorExit thrown AT its yield rather than by
+    # returning, so this driver reaches the same half-done state the async one does
+    # on cancellation, and owes the same tail-carry.
+    reached = 0
+    try:
+        for reached, raw in enumerate(keys):
+            key = _sanitize_open_slot_key(raw)
+            if key is None or key in state._slots:
+                continue
+            try:
+                # Ask whether the metadata READ succeeded, not just whether it came
+                # back empty (``with_status``) — see _prefetch_rehydrate_inputs.
+                #
+                # These reads MUST stay inside the per-tab guard. The async driver
+                # has no except at its call site either, so anything escaping here
+                # aborts dashboard startup and costs every LATER tab too.
+                meta, readable, messages, model_map, member_identity, agent, effort_marker = (
+                    _prefetch_rehydrate_inputs(
+                        state.conversation_log,
+                        slot_transcript_key(key),
+                        kiro_model_map=kiro_model_map,
+                        with_status=True,
+                    )
                 )
-            )
-            restored += _apply_restored_open_slot(
-                state,
-                key,
-                meta=meta,
-                readable=readable,
-                messages=messages,
-                model_map=model_map,
-                member_identity=member_identity,
-                agent=agent,
-                effort_marker=effort_marker,
-                unrestored=unrestored,
-                preserve_remote_only=preserve_remote_only,
-            )
-        except Exception:
-            logger.debug("restore_open_slots: rehydrate failed for %s", key, exc_info=True)
-            # Same epistemic position as an unreadable read: the session was not
-            # shown to be gone, so keep its key rather than erasing the seed.
-            unrestored.add(key)
-            # No rollback here: _rehydrate_slot_from_history undoes its own
-            # partial slot and restricted key, so every caller gets it rather
-            # than only the ones that remembered to compensate.
-        # Restore-time recovery of an app flag whose claim outlived it, after the
-        # handler above rather than inside it: a failure here must not mark the
-        # tab unrestored over a display flag. This driver's reads are inline by
-        # construction, so the spool read is too.
-        _recovered_slot = state._slots.get(key)
-        if _recovered_slot is not None:
-            _recover_mcp_app_claims(_recovered_slot)
-        # One yield point per tab, reached on EVERY outcome. A failing tab still
-        # costs real I/O, so a run of failing tabs that skipped the yield would
-        # monopolise the loop and feed the stall watchdog. The sync driver just
-        # spins through it; the async driver has its own per-tab yield.
-        yield restored
+                restored += _apply_restored_open_slot(
+                    state,
+                    key,
+                    meta=meta,
+                    readable=readable,
+                    messages=messages,
+                    model_map=model_map,
+                    member_identity=member_identity,
+                    agent=agent,
+                    effort_marker=effort_marker,
+                    unrestored=unrestored,
+                    preserve_remote_only=preserve_remote_only,
+                    dropped=dropped,
+                )
+            except Exception:
+                logger.debug("restore_open_slots: rehydrate failed for %s", key, exc_info=True)
+                # Same epistemic position as an unreadable read: the session was not
+                # shown to be gone, so keep its key rather than erasing the seed.
+                unrestored.add(key)
+                dropped.add(key)
+                # No rollback here: _rehydrate_slot_from_history undoes its own
+                # partial slot and restricted key, so every caller gets it rather
+                # than only the ones that remembered to compensate.
+            # Restore-time recovery of an app flag whose claim outlived it, after the
+            # handler above rather than inside it: a failure here must not mark the
+            # tab unrestored over a display flag. This driver's reads are inline by
+            # construction, so the spool read is too.
+            _recovered_slot = state._slots.get(key)
+            if _recovered_slot is not None:
+                _recover_mcp_app_claims(_recovered_slot)
+            # One yield point per tab, reached on EVERY outcome. A failing tab still
+            # costs real I/O, so a run of failing tabs that skipped the yield would
+            # monopolise the loop and feed the stall watchdog. The sync driver just
+            # spins through it; the async driver has its own per-tab yield.
+            yield restored
+    except BaseException:
+        # Every key from the one in hand onward is UNREAD, so it goes back into the
+        # reopen seed -- see _carry_unread_slot_keys for why the latch flipping in the
+        # caller's finally makes that the difference between a stale tab and a lost
+        # one. ``BaseException`` because the throw that ends a generator is
+        # GeneratorExit, which is not an Exception. Carrying the key in hand too even
+        # when it restored is harmless: _persist_open_slots dedups the union.
+        _carry_unread_slot_keys(keys[reached:], unrestored)
+        raise
     if restored:
         logger.info("Restored %d open tab(s) from open_slots.json", restored)
+    # After the loop, so the counts are final. Not in a finally: on the abort path the
+    # keys were just carried back into the seed, and this restore has no final answer
+    # about them to record.
+    _record_unrestored_open_tabs(state, listed=len(keys), restored=restored, kept=dropped)
+
+
+def _carry_unread_slot_keys(raw_keys: "Sequence[object]", unrestored: set[str]) -> int:
+    """Keep every key in *raw_keys* in the reopen seed; return how many were added.
+
+    What a restore owes the keys it never got to. Both drivers flip
+    ``open_slots_restored`` in a ``finally``, which tells the persist writers that
+    ``_slots`` is now the authoritative open-tab set -- and that is a true statement
+    only for a restore that RAN TO THE END. Cancelled at tab 1 of 16, the latch flips
+    anyway and the next 5s flush prunes the file down to the one tab that made it,
+    which turns a shutdown landing mid-restore into fifteen tabs the next boot places
+    in "older sessions".
+
+    The honest position for an unread key is the one an unreadable read already gets:
+    the session was not shown to be gone, so the key stays in the seed. Carried
+    through ``unrestored_slot_keys``, which ``_persist_open_slots`` already folds back
+    into every snapshot, rather than by holding the latch down -- a latch left down
+    keeps the persist writers in pre-restore merge mode for the rest of the process,
+    where they can never prune a tab the user really did close.
+    """
+    carried = 0
+    for raw in raw_keys:
+        key = _sanitize_open_slot_key(raw)
+        if key is None or key in unrestored:
+            continue
+        unrestored.add(key)
+        carried += 1
+    return carried
+
+
+def _record_unrestored_open_tabs(
+    state: DashboardState,
+    *,
+    listed: int,
+    restored: int,
+    kept: "Iterable[str]",
+) -> None:
+    """Leave a durable account of the listed tabs that should be here and are not.
+
+    *kept* is the DROPPED subset rather than every key in the reopen seed, for the
+    reason :func:`_apply_restored_open_slot` gives: a remote-only seed is expected to
+    sit in that set across boots, and counting it would raise this notice on every
+    restart of a system behaving correctly.
+
+    Blocking: one store read per kept key to resolve the log it writes, then one
+    queued append each. Called from a worker thread, and only when a key was
+    actually kept -- the healthy restore pays nothing.
+
+    Also publishes the count the dashboard reads for its notice. That is here rather
+    than at each ``unrestored.add`` site so the number the user is shown and the
+    number the log records are one count taken at one moment.
+    """
+    keys = sorted(kept)
+    state.unrestored_slot_notice = {"count": len(keys), "keys": keys}
+    if not keys:
+        return
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+    except Exception:  # pragma: no cover - crew log unavailable
+        return
+    if not crew_log_emit.enabled():
+        return
+    for key in keys:
+        try:
+            sid, _decided, _complete = crew_log_emit.slot_previous_store(key)
+            if not sid:
+                # No store under this slot to append to. The notice still carries the
+                # key, which is the half the user acts on.
+                continue
+            crew_log_emit.on_open_tab_unrestored(
+                sid, listed=listed, restored=restored, kept=len(keys)
+            )
+        except Exception:
+            logger.debug("restore_open_slots: could not record the drop of %s", key, exc_info=True)
 
 
 def _apply_restored_open_slot(
@@ -597,6 +697,7 @@ def _apply_restored_open_slot(
     conv_log: ConversationLog | None = None,
     started: float | None = None,
     preserve_remote_only: bool = False,
+    dropped: set[str] | None = None,
 ) -> int:
     """Turn one prefetched open-tab read into a slot; return 1 if it restored.
 
@@ -614,9 +715,20 @@ def _apply_restored_open_slot(
     the authority pair was restored from a remote snapshot without the
     transcripts, a listed slot with no local transcript is a remote-only reopen
     seed to keep, not a dead tab to prune.
+
+    *dropped* collects the keys a reader should be TOLD about, which is a narrower
+    set than *unrestored*. Both keep the key in the reopen seed, but they answer
+    different questions: ``unrestored`` is "do not prune this", while ``dropped`` is
+    "this tab should be here and is not". A remote-only seed is in the first and not
+    the second -- its transcript arrives lazily by design, and it stays in the seed
+    across every boot, so counting it would raise the same warning on every restart
+    for a system working as intended. A warning that repeats forever is one the user
+    learns to ignore, which costs the real loss its only visible signal.
     """
     if not readable:
         unrestored.add(key)
+        if dropped is not None:
+            dropped.add(key)
         logger.warning(
             "restore_open_slots: metadata unreadable for %s; keeping it "
             "in the reopen seed for the next restore instead of dropping it",
@@ -718,7 +830,13 @@ def restore_open_slots(state: DashboardState) -> int:
         # file): an empty ``_slots`` from here on is authoritative, so the
         # periodic flush may snapshot open_slots.json again — see
         # DashboardState._persist_open_slots.
-        state.open_slots_restored = True
+        #
+        # Unless the set was never KNOWABLE. Every generation that could hold it was
+        # refused by the OS, so this process has no basis for calling ``_slots``
+        # authoritative, and leaving the latch down keeps the persist writers in
+        # merge mode for the rest of its life — which is the correct posture, not a
+        # stuck flag: a process that never learned the set must never prune it.
+        state.open_slots_restored = bool(getattr(state, "open_slots_knowable", True))
     return restored
 
 
@@ -764,65 +882,95 @@ async def restore_open_slots_async(state: DashboardState) -> int:
         # permanent pre-restore merge mode.
         if not state.conversation_log:
             return 0
-        keys = await asyncio.to_thread(_read_open_slots_keys)
+        keys, known = await asyncio.to_thread(_read_open_slots_snapshot)
+        # Published before the early return below, for the reason the generator's own
+        # copy of this line gives: the latch in the finally reads it.
+        state.open_slots_knowable = known
         if not keys:
             return 0
         # Rebound only once there is a snapshot to restore FROM, matching the
         # generator: a missing/malformed file must not clear a carried set.
         unrestored: set[str] = set()
         state.unrestored_slot_keys = unrestored
+        # The subset a reader is told about -- see _apply_restored_open_slot.
+        dropped: set[str] = set()
         conv_log = state.conversation_log
         # Read once per restore (see _transcripts_may_be_remote_only).
         preserve_remote_only = _transcripts_may_be_remote_only()
         kiro_model_map = await asyncio.to_thread(_build_kiro_model_map)
-        for raw in keys:
-            key = _sanitize_open_slot_key(raw)
-            if key is None or key in state._slots:
-                continue
-            try:
-                started = time.time()
-                meta, readable, messages, model_map, member_identity, agent, effort_marker = (
-                    await asyncio.to_thread(
-                        _prefetch_rehydrate_inputs,
-                        conv_log,
-                        slot_transcript_key(key),
-                        kiro_model_map=kiro_model_map,
-                        with_status=True,
+        # Which key the loop is on, so a cancellation can name the ones it never
+        # read. This driver awaits once per tab, so a shutdown landing in the middle
+        # of a 16-tab restore is the ordinary case rather than an exotic one.
+        reached = 0
+        try:
+            for reached, raw in enumerate(keys):
+                key = _sanitize_open_slot_key(raw)
+                if key is None or key in state._slots:
+                    continue
+                try:
+                    started = time.time()
+                    meta, readable, messages, model_map, member_identity, agent, effort_marker = (
+                        await asyncio.to_thread(
+                            _prefetch_rehydrate_inputs,
+                            conv_log,
+                            slot_transcript_key(key),
+                            kiro_model_map=kiro_model_map,
+                            with_status=True,
+                        )
                     )
-                )
-                restored += _apply_restored_open_slot(
-                    state,
-                    key,
-                    meta=meta,
-                    readable=readable,
-                    messages=messages,
-                    model_map=model_map,
-                    member_identity=member_identity,
-                    agent=agent,
-                    effort_marker=effort_marker,
-                    unrestored=unrestored,
-                    # Opts into the post-hop re-checks (close tombstone +
-                    # deletion): this driver's read ran in a worker thread, so
-                    # its answers can have gone stale.
-                    conv_log=conv_log,
-                    started=started,
-                    preserve_remote_only=preserve_remote_only,
-                )
-            except Exception:
-                logger.debug("restore_open_slots: rehydrate failed for %s", key, exc_info=True)
-                unrestored.add(key)
-            # Same recovery as the inline driver, with the spool read awaited:
-            # this driver runs on the loop, where a scan would stall the gateway.
-            _recovered_slot = state._slots.get(key)
-            if _recovered_slot is not None:
-                await _recover_mcp_app_claims_async(_recovered_slot)
-            # sleep(0) yields to the ready queue without adding wall-clock delay.
-            # Reached on EVERY outcome, including a failing tab (see the
-            # generator's note) — and still needed with the reads offloaded,
-            # because the apply half above runs here.
-            await asyncio.sleep(0)
+                    restored += _apply_restored_open_slot(
+                        state,
+                        key,
+                        meta=meta,
+                        readable=readable,
+                        messages=messages,
+                        model_map=model_map,
+                        member_identity=member_identity,
+                        agent=agent,
+                        effort_marker=effort_marker,
+                        unrestored=unrestored,
+                        # Opts into the post-hop re-checks (close tombstone +
+                        # deletion): this driver's read ran in a worker thread, so
+                        # its answers can have gone stale.
+                        conv_log=conv_log,
+                        started=started,
+                        preserve_remote_only=preserve_remote_only,
+                        dropped=dropped,
+                    )
+                except Exception:
+                    logger.debug("restore_open_slots: rehydrate failed for %s", key, exc_info=True)
+                    unrestored.add(key)
+                    dropped.add(key)
+                # Same recovery as the inline driver, with the spool read awaited:
+                # this driver runs on the loop, where a scan would stall the gateway.
+                _recovered_slot = state._slots.get(key)
+                if _recovered_slot is not None:
+                    await _recover_mcp_app_claims_async(_recovered_slot)
+                # sleep(0) yields to the ready queue without adding wall-clock delay.
+                # Reached on EVERY outcome, including a failing tab (see the
+                # generator's note) — and still needed with the reads offloaded,
+                # because the apply half above runs here.
+                await asyncio.sleep(0)
+        except BaseException:
+            # Cancelled (or aborted) mid-restore: every key from the one in hand
+            # onward is UNREAD. ``BaseException`` because asyncio.CancelledError is
+            # not an Exception, and cancellation is precisely the case the latch in
+            # the finally below gets wrong -- it tells the persist writers ``_slots``
+            # is authoritative when this loop never looked at most of the file.
+            _carry_unread_slot_keys(keys[reached:], unrestored)
+            raise
         if restored:
             logger.info("Restored %d open tab(s) from open_slots.json", restored)
+        # Off the loop: the per-key store read that resolves which log to append to
+        # lists a directory per key (see emit.slot_previous_store), which is exactly
+        # the blocking work the rest of this driver exists to hoist.
+        await asyncio.to_thread(
+            _record_unrestored_open_tabs,
+            state,
+            listed=len(keys),
+            restored=restored,
+            kept=dropped,
+        )
     finally:
         # Always clear, even if a rehydrate raises — a stuck flag would silently
         # disable open-tab persistence for the rest of the process's life.
@@ -830,8 +978,9 @@ async def restore_open_slots_async(state: DashboardState) -> int:
         # The open-tab restore has run this boot (even on an early return or a
         # raise): an empty ``_slots`` is authoritative from here, so a periodic
         # flush may snapshot open_slots.json again — see
-        # DashboardState._persist_open_slots.
-        state.open_slots_restored = True
+        # DashboardState._persist_open_slots. Held down when the set was never
+        # knowable, for the reason the synchronous driver's own finally gives.
+        state.open_slots_restored = bool(getattr(state, "open_slots_knowable", True))
     return restored
 
 
@@ -2827,6 +2976,7 @@ from kiro_crew.dashboard.slot_persistence.restore_inputs import (  # noqa: E402,
     _load_restore_cfg,
     _read_mcp_app_claims,
     _read_open_slots_keys,
+    _read_open_slots_snapshot,
     _recent_session_slot_name,
     _reconcile_mcp_app_claims,
     _recover_mcp_app_claims,
