@@ -632,6 +632,80 @@ describe('ChatPanel — Context', () => {
   })
 })
 
+describe('ChatPanel — Compaction Wait Budget', () => {
+  const field = () => screen.findByRole('spinbutton', { name: 'Auto-compact wait (seconds)' })
+
+  it('shows the stored value, including one off the presets', async () => {
+    seedMc({ session: { compact_wait_secs: 450 } })
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(450))
+  })
+
+  it('PATCHes a typed value on blur and shows no notice when it is kept', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    patchConfigMock.mockImplementationOnce(() => Promise.resolve({}))
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '900' } })
+    fireEvent.blur(input)
+    await waitFor(() =>
+      expect(patchConfigMock).toHaveBeenCalledWith('session.compact_wait_secs', 900)
+    )
+    expect(screen.queryByText(/outside the allowed range/)).not.toBeInTheDocument()
+  })
+
+  it('shows the value the server clamped to, with a notice', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    patchConfigMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        clamp_notice: { path: 'session.compact_wait_secs', requested: 20, stored: 60, min: 60, max: 3600 },
+      }) as never
+    )
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '20' } })
+    fireEvent.blur(input)
+    expect(await screen.findByRole('status')).toHaveTextContent(/outside the allowed range/)
+    expect(input).toHaveValue(60)
+  })
+
+  it('says the unit and what 0 means without a hover', async () => {
+    wrap('advanced')
+    await field()
+    expect(screen.getByText('0 = built-in default (5 min). Otherwise 60 to 3,600.')).toBeInTheDocument()
+  })
+
+  it('locks the field while a save is in flight, so its result cannot erase a newer draft', async () => {
+    seedMc({ session: { compact_wait_secs: 0 } })
+    let settle: (v: unknown) => void = () => {}
+    patchConfigMock.mockImplementationOnce(() => new Promise(r => { settle = r }) as never)
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(0))
+    fireEvent.change(input, { target: { value: '20' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(input).toBeDisabled())
+    settle({ clamp_notice: { path: 'session.compact_wait_secs', requested: 20, stored: 60, min: 60, max: 3600 } })
+    await waitFor(() => expect(input).not.toBeDisabled())
+    expect(input).toHaveValue(60)
+  })
+
+  it('surfaces a failed write and restores the saved value', async () => {
+    seedMc({ session: { compact_wait_secs: 300 } })
+    rejectOnce(patchConfigMock)
+    wrap('advanced')
+    const input = await field()
+    await waitFor(() => expect(input).toHaveValue(300))
+    fireEvent.change(input, { target: { value: '600' } })
+    fireEvent.blur(input)
+    expect(await screen.findByText(/Failed to save compaction wait budget/)).toBeInTheDocument()
+    await waitFor(() => expect(input).toHaveValue(300))
+  })
+})
+
 describe('ChatPanel — Subagents', () => {
   it('PATCHes the completion-keep mode on selection', async () => {
     wrap('advanced')

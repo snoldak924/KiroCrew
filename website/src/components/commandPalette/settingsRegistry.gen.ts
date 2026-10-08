@@ -824,6 +824,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "session.autocompact_pct"
   },
   {
+    "id": "chat.auto-compact-wait-seconds",
+    "label": "Auto-compact wait (seconds)",
+    "labelKey": "pages.settings.chatPanel.compaction_wait_budget",
+    "description": "How long to wait for a compaction to finish. Raise it if compaction on a large context regularly needs more than 5 minutes. 0 = built-in default (5 min). Otherwise 60 to 3,600.",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    },
+    "configKey": "session.compact_wait_secs"
+  },
+  {
     "id": "chat.auto-open-git-in-side-panel",
     "label": "Auto-Open Git in Side Panel",
     "labelKey": "pages.settings.chatPanel.auto_open_git_panel",

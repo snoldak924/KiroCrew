@@ -15586,7 +15586,12 @@
         "message_font_size_desc": "Tamanho da fonte da conversa, em todas as sessões: texto das mensagens, código, tabelas, respostas sugeridas e o campo de entrada de mensagens. A largura de conteúdo compacta cresce na mesma proporção. A barra lateral, a lista de sessões e o restante da interface não são afetados.",
         "remove_the_agents_pin": "Remover a fixação",
         "failed_to_clear_agent_model_pin": "Não foi possível remover o modelo fixado do agente ({{error}}). Tente novamente.",
-        "failed_to_clear_agent_model_pin_no_reason": "Não foi possível remover o modelo fixado do agente. Tente novamente."
+        "failed_to_clear_agent_model_pin_no_reason": "Não foi possível remover o modelo fixado do agente. Tente novamente.",
+        "compaction_wait_budget": "Espera da compactação automática (segundos)",
+        "compaction_wait_budget_description": "0 = padrão integrado (5 min). Caso contrário, de 60 a 3.600.",
+        "compaction_wait_budget_hint": "Quanto tempo esperar uma compactação terminar. Aumente se a compactação de um contexto grande costuma levar mais de 5 minutos.",
+        "compaction_wait_budget_clamped": "{{stored}} salvo. {{requested}} está fora do intervalo permitido ({{min}} a {{max}}).",
+        "failed_to_save_compaction_wait_budget": "Não foi possível salvar o tempo de espera da compactação"
       },
       "computerUsePanel": {
         "accessibility": "Acessibilidade",

@@ -15114,7 +15114,12 @@
         "message_font_size_desc": "会話のフォントサイズ（すべてのセッションに適用）：メッセージのテキスト、コード、表、返信候補、メッセージ入力欄。コンパクトなコンテンツ幅もそれに合わせて広がります。サイドバー、セッション一覧、その他のUIには影響しません。",
         "remove_the_agents_pin": "固定を解除",
         "failed_to_clear_agent_model_pin": "エージェントの固定モデルを解除できませんでした（{{error}}）。もう一度お試しください。",
-        "failed_to_clear_agent_model_pin_no_reason": "エージェントの固定モデルを解除できませんでした。もう一度お試しください。"
+        "failed_to_clear_agent_model_pin_no_reason": "エージェントの固定モデルを解除できませんでした。もう一度お試しください。",
+        "compaction_wait_budget": "自動圧縮の待機時間（秒）",
+        "compaction_wait_budget_description": "0 = 組み込みの既定値（5 分）。それ以外は 60〜3,600。",
+        "compaction_wait_budget_hint": "圧縮の完了を待つ時間です。大きなコンテキストの圧縮によく 5 分以上かかる場合は、値を上げてください。",
+        "compaction_wait_budget_clamped": "{{stored}} を保存しました。{{requested}} は許可された範囲（{{min}}〜{{max}}）外です。",
+        "failed_to_save_compaction_wait_budget": "圧縮の待機時間を保存できませんでした"
       },
       "computerUsePanel": {
         "accessibility": "アクセシビリティ",

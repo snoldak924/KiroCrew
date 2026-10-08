@@ -15114,7 +15114,12 @@
         "message_font_size_desc": "所有会话中对话内容的字号：消息文本、代码、表格、建议回复和消息输入框。紧凑内容宽度会随之增大。侧边栏、会话列表和其余界面不受影响。",
         "remove_the_agents_pin": "清除其置顶",
         "failed_to_clear_agent_model_pin": "无法清除代理已置顶的模型（{{error}}）。请重试。",
-        "failed_to_clear_agent_model_pin_no_reason": "无法清除代理已置顶的模型。请重试。"
+        "failed_to_clear_agent_model_pin_no_reason": "无法清除代理已置顶的模型。请重试。",
+        "compaction_wait_budget": "自动压缩等待（秒）",
+        "compaction_wait_budget_description": "0 = 内置默认值（5 分钟）。其他值为 60 到 3,600。",
+        "compaction_wait_budget_hint": "等待一次压缩完成的时长。如果大上下文的压缩经常需要超过 5 分钟，请调高它。",
+        "compaction_wait_budget_clamped": "已保存 {{stored}}。{{requested}} 超出允许范围（{{min}} 到 {{max}}）。",
+        "failed_to_save_compaction_wait_budget": "无法保存压缩等待时长"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",
