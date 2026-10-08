@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { AlarmClock, Brain, ChevronLeft, ChevronRight, Cpu, FolderOpen, Goal, IdCard, NotebookPen, Pencil, Route, Shield, X } from 'lucide-react'
+import { AlarmClock, Brain, ChevronLeft, ChevronRight, Cpu, FolderOpen, Goal, IdCard, Loader2, MessageSquarePlus, NotebookPen, Pencil, Route, Shield, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
@@ -53,20 +53,42 @@ export interface CrewProfilePanelProps {
   onRequestBack: (proceed: () => void) => void
   onEdit: () => void
   onOpenFiles: () => void
+  /** Start a fresh conversation on this crewmate's thread: it forgets what was
+   *  said, the transcript and its long-term memory stay. The host owns the ask,
+   *  the call and the outcome — this card owns only the door. Absent when there
+   *  is no confirmed thread to reset. */
+  onNewConversation?: () => void
+  /** That flow is running: the stop, the wait for the turn to let go, the
+   *  reset. Holds the row, because a second press would stack a second flow on
+   *  the same slot. */
+  newConversationBusy?: boolean
+  /** The flow's own refusal or failure, rendered under the row — beside the
+   *  control that caused it. The host keeps the state and shows it above the
+   *  thread instead whenever this card is closed, so there is one copy. */
+  newConversationError?: ReactNode
 }
 
-const TONE: Record<'accent' | 'ok' | 'warn' | 'info', string> = {
+const TONE: Record<'accent' | 'ok' | 'warn' | 'info' | 'danger', string> = {
   accent: 'bg-accent-subtle text-accent',
   ok: 'bg-ok-subtle text-ok',
   warn: 'bg-warn-subtle text-warn',
   info: 'bg-info-subtle text-info',
+  danger: 'bg-danger-subtle text-danger',
 }
 
-function Row({ icon, tone = 'accent', label, sub, onClick, testId }: {
+function Row({ icon, tone = 'accent', label, sub, danger, busy, onClick, testId }: {
   icon: ReactNode
   tone?: keyof typeof TONE
   label: string
   sub?: string
+  /** The row's own label reads in the theme's danger colour. For a row whose
+   *  action cannot be undone, so the colour is the warning the reader gets
+   *  before the dialog states it. The SUB line stays muted: red on both lines
+   *  makes the row shout, and the consequence sentence is the quieter half. */
+  danger?: boolean
+  /** The row's action is running. Held rather than hidden, so the row keeps its
+   *  place, and the chevron becomes a spinner: the press did land. */
+  busy?: boolean
   onClick: () => void
   testId: string
 }) {
@@ -74,15 +96,21 @@ function Row({ icon, tone = 'accent', label, sub, onClick, testId }: {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-3 w-full px-3.5 py-3 text-left border-t border-border first:border-t-0 hover:bg-bg-hover transition-colors cursor-pointer"
+      disabled={busy}
+      className={cn(
+        'flex items-center gap-3 w-full px-3.5 py-3 text-left border-t border-border first:border-t-0 transition-colors',
+        busy ? 'opacity-60 cursor-default' : 'hover:bg-bg-hover cursor-pointer',
+      )}
       data-testid={testId}
     >
       <span className={cn('w-8 h-8 rounded-[9px] grid place-items-center shrink-0', TONE[tone])} aria-hidden="true">{icon}</span>
       <span className="flex-1 min-w-0 leading-tight">
-        <span className="block text-[13px] font-semibold truncate">{label}</span>
+        <span className={cn('block text-[13px] font-semibold truncate', danger && 'text-danger')}>{label}</span>
         {sub && <span className="block text-[12px] text-muted truncate">{sub}</span>}
       </span>
-      <ChevronRight size={15} className="text-muted shrink-0" aria-hidden="true" />
+      {busy
+        ? <Loader2 size={15} className="text-muted shrink-0 animate-spin" aria-hidden="true" />
+        : <ChevronRight size={15} className="text-muted shrink-0" aria-hidden="true" />}
     </button>
   )
 }
@@ -320,6 +348,39 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
                   <Row icon={<Shield size={16} />} tone="ok" label={t('pages.membersPage.profile_permissions')} sub={t('pages.membersPage.profile_permissions_sub')} onClick={p.onEdit} testId="crew-profile-permissions" />
                   <Row icon={<Cpu size={16} />} tone="info" label={t('pages.membersPage.profile_model')} sub={p.member.model || t('pages.membersPage.profile_model_auto')} onClick={p.onEdit} testId="crew-profile-model" />
                 </div>
+
+                {/* LAST on the tab, and on purpose. The rows above are doors
+                    into what the crewmate IS; this one throws away what it
+                    currently knows, so it sits below everything else in its own
+                    group rather than in the list of doors — a reader scanning
+                    the card reaches it only after there is nothing else left.
+                    Red label for the same reason: the colour is the warning
+                    that arrives before the dialog's sentence.
+
+                    NOT disabled while the crewmate is working, which is the
+                    whole point of it living here: a stuck turn is the one
+                    occasion anybody wants this, and the host's flow stops that
+                    turn before it asks for the reset. */}
+                {p.onNewConversation && (
+                  <div className="rounded-2xl border border-border bg-bg overflow-hidden" data-testid="crew-profile-reset-group">
+                    <Row
+                      icon={<MessageSquarePlus size={16} />}
+                      tone="danger"
+                      danger
+                      busy={p.newConversationBusy}
+                      // "New conversation", the one name this action carries
+                      // everywhere else — the dialog, the notices, the
+                      // transcript's boundary row, the feature map. The
+                      // dialog's own button says "Start a new conversation",
+                      // which is the same action in the imperative.
+                      label={t('pages.membersPage.new_conversation')}
+                      sub={t('pages.membersPage.new_conversation_row_sub', { name })}
+                      onClick={p.onNewConversation}
+                      testId="crew-profile-new-conversation"
+                    />
+                  </div>
+                )}
+                {p.newConversationError}
               </div>
             )}
             {tab === 'schedule' && (
