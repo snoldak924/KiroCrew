@@ -9,6 +9,7 @@ import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
+import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from '../pages/chat/composerDockMetrics'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
 import { busySteerFlag } from './chat-input/busySend'
@@ -1528,12 +1529,15 @@ export default function ChatPane({
     [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession],
   )
 
+  // The composer dock floats over the bottom of the scroller (ChatPage's
+  // layout, shared measurement): `dockH` is what the scroller pays below its
+  // last row, `inputAreaRef` the quote flight's landing box.
+  const { inputAreaRef, dockH, dockGutter, dockRef } = useComposerDockMetrics(scrollerRef)
   // Quote / Ask on selected assistant text — the same chat-core seam the main
   // chat uses (chat-core/composer/selectionActions), bound to THIS pane's
   // composer and slot. Before this the pane's selection toolbar offered Copy
   // only: the SDK's assistant row draws the actions the host hands it, and no
   // host but ChatPage handed any.
-  const inputAreaRef = useRef<HTMLDivElement>(null)
   const { onQuote, onAsk, quoteFlight, endQuoteFlight } = useSelectionQuoteAsk({ slot: slotKey, setInput, revealComposer, openSideChat })
 
   const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-hidden focus-visible:border-accent'
@@ -1707,7 +1711,10 @@ export default function ChatPane({
             scrollerRef,
             onScroll: onScrollPin,
             onAtBottomChange: setIsAtBottom,
-            scrollerStyle: { paddingTop: 12, paddingBottom: 12, minHeight: 0 },
+            // The dock floats over the scroller's bottom edge, so the scroller
+            // pays for the covered strip plus the same clearance ChatPage keeps
+            // between its last line and the glass.
+            scrollerStyle: { paddingTop: 12, paddingBottom: dockH + DOCK_CLEARANCE_PX, minHeight: 0 },
             // handOff off: its navigation would discard this pane's unsaved draft.
             earlier: pagesActiveSlot
               ? { hasMore: activeHasMore, loading: loadingOlder, failed: olderFailed, onLoad: loadOlder, handOff: false }
@@ -1797,11 +1804,20 @@ export default function ChatPane({
             ),
           }}
         />
-        {/* Bottom fade overlays the scroller's last 24px above the status bars
-            and composer (in-flow height cancelled by its own negative margin). */}
-        <EdgeFade side="bottom" />
-
-        <div className="relative">
+        {/* Composer dock. Floats over the bottom of the transcript scroller
+            instead of sitting under it in the flex column (ChatPage's iOS
+            toolbar layout, decided in
+            docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md):
+            the scroller runs the full height of the pane and the conversation
+            scrolls UNDER the glass; the scroller pays for the covered strip
+            with `paddingBottom: dockH + DOCK_CLEARANCE_PX`, measured from this
+            box by `dockRef`. No opaque bottom fade any more: the material's
+            blur and tint keep the dock legible. `dock-inert` (index.css) lets
+            the root pass input through while every bar, card and the composer
+            — each a direct child — still catches it. No z-index on purpose:
+            the dock paints over the scroller because it follows it in DOM
+            order. `right: dockGutter` keeps the scrollbar column clear. */}
+        <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none dock-inert" style={{ right: dockGutter }} data-testid="composer-dock-root">
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
